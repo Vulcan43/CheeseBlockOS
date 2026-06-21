@@ -574,7 +574,7 @@ let userApiKey=localStorage.getItem('cb_apikey')||'';
 
 function init(){
   buildSG();startClock();initBat();setupDesk();buildDW();buildDeskIcons();
-  if(typeof applyWP==='function' && WPS.find(x=>x.id===currentWP)) applyWP(currentWP);
+  if(typeof applyInitialWallpaper==='function') applyInitialWallpaper();
   openApp('browser');
 }
 
@@ -796,6 +796,7 @@ function renderBrowser(){
         <option value="2">allorigins.win</option>
         <option value="direct">Direct (may fail)</option>
       </select>
+      <span style="color:var(--t3);font-size:10px" title="Search engines and JS-heavy sites often block proxy loading. Simple sites like Wikipedia work best. Use ↗ to open any page in a real tab.">ⓘ Some sites won't load via proxy</span>
       <span style="margin-left:auto;color:var(--green);font-size:10px">● AdBlock Active</span>
     </div>`;
 }
@@ -854,7 +855,7 @@ async function loadBrowserTab(idx,url){
   }
 }
 function onBrLoad(f){try{const u=f.contentWindow.location.href;if(u&&u!=='about:blank'&&btabs[bActiveTab]){btabs[bActiveTab].url=u;const b=document.getElementById('brurl');if(b)b.value=u;}}catch(e){}renderBrowTabs();}
-function brGo(url){if(!url)return;url=url.trim();if(!url.startsWith('http')&&!url.includes('.'))url='https://www.google.com/search?q='+encodeURIComponent(url);else if(!url.startsWith('http'))url='https://'+url;btabs[bActiveTab].url=url;btabs[bActiveTab].title=getDomain(url);loadBrowserTab(bActiveTab,url);}
+function brGo(url){if(!url)return;url=url.trim();if(!url.startsWith('http')&&!url.includes('.'))url='https://html.duckduckgo.com/html/?q='+encodeURIComponent(url);else if(!url.startsWith('http'))url='https://'+url;btabs[bActiveTab].url=url;btabs[bActiveTab].title=getDomain(url);loadBrowserTab(bActiveTab,url);}
 function brNav(act){if(act==='back'){const f=document.getElementById('brframe');try{f.contentWindow.history.back();}catch(e){}}else if(act==='fwd'){const f=document.getElementById('brframe');try{f.contentWindow.history.forward();}catch(e){}}else if(act==='reload'){const u=btabs[bActiveTab]?.url;if(u)loadBrowserTab(bActiveTab,u);}else if(act==='home')brGo('https://en.wikipedia.org/wiki/Main_Page');}
 function addBTab(){btabs.push({id:'t'+Date.now(),url:'',title:'New Tab'});bActiveTab=btabs.length-1;renderBrowser();}
 function switchBTab(i){bActiveTab=i;renderBrowser();if(btabs[i].url)loadBrowserTab(i,btabs[i].url);}
@@ -865,8 +866,9 @@ function getDomain(url){try{return new URL(url).hostname.replace('www.','')}catc
 /* ══════════════════════════════════════════
    🤖 AI 1 — LOCAL GENERAL AI (SmolLM2-360M, offline, free)
    🤖 AI 2 — LOCAL CODING AI (Qwen2.5-Coder-0.5B, offline, free)
-   Both run via Transformers.js + WebGPU/WASM, 100% in-browser.
-   Requires http(s):// origin — ES module import() is blocked on file://
+   Both run via Transformers.js inside a WEB WORKER (separate thread),
+   so model download + inference NEVER block or freeze the page/UI.
+   Requires http(s):// origin — module workers are blocked on file://
 ══════════════════════════════════════════ */
 const MODES1={
   general:{lbl:'General',sys:'You are CheeseBlock Local AI, a small assistant running entirely offline in the browser. Be concise and helpful.'},
@@ -878,17 +880,89 @@ const MODES2={
   explain:{lbl:'Explain Code',sys:'You are CheeseBlock Code AI. Explain code clearly and concisely, line by line if short, or in summary if long.'},
 };
 
-async function ensureTransformers(){
+/* ---- Worker source, built as a Blob so no extra file is needed ---- */
+const AI_WORKER_SRC = `
+import { pipeline } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.0.0';
+const generators = {};
+self.onmessage = async (e) => {
+  const { type, id, slot, model, messages, maxTokens, temperature } = e.data;
+  try {
+    if (type === 'load') {
+      if (!generators[slot]) {
+        generators[slot] = await pipeline('text-generation', model, {
+          dtype: 'q4',
+          progress_callback: (p) => {
+            if (p.status === 'progress') {
+              self.postMessage({ type:'progress', slot, progress: p.progress||0 });
+            }
+          }
+        });
+      }
+      self.postMessage({ type:'loaded', id, slot });
+    } else if (type === 'generate') {
+      const gen = generators[slot];
+      if (!gen) throw new Error('Model not loaded yet');
+      const output = await gen(messages, { max_new_tokens:maxTokens||220, temperature:temperature||0.7, do_sample:true });
+      let reply = output[0]?.generated_text;
+      if (Array.isArray(reply)) reply = reply[reply.length-1]?.content || '';
+      self.postMessage({ type:'result', id, slot, reply: (reply||'').trim() });
+    }
+  } catch (err) {
+    self.postMessage({ type:'error', id, slot, message: err?.message || String(err) });
+  }
+};
+`;
+
+let aiWorker = null;
+let aiWorkerReqId = 0;
+const aiWorkerPending = {};
+const aiWorkerLoaded = { ai1:false, ai2:false };
+const aiWorkerProgressCbs = { ai1:null, ai2:null };
+
+function getAIWorker(){
+  if(aiWorker) return aiWorker;
+  const blob = new Blob([AI_WORKER_SRC], {type:'application/javascript'});
+  const blobUrl = URL.createObjectURL(blob);
+  aiWorker = new Worker(blobUrl, {type:'module'});
+  aiWorker.onmessage = (e)=>{
+    const {type,id,slot,progress,reply,message} = e.data;
+    if(type==='progress'){
+      if(aiWorkerProgressCbs[slot]) aiWorkerProgressCbs[slot](progress);
+      return;
+    }
+    const pending = aiWorkerPending[id];
+    if(!pending) return;
+    delete aiWorkerPending[id];
+    if(type==='loaded'){ aiWorkerLoaded[slot]=true; pending.resolve(); }
+    else if(type==='result'){ pending.resolve(reply); }
+    else if(type==='error'){ pending.reject(new Error(message)); }
+  };
+  aiWorker.onerror = (e)=>{
+    Object.values(aiWorkerPending).forEach(p=>p.reject(new Error('Worker crashed: '+(e.message||'unknown error'))));
+  };
+  return aiWorker;
+}
+
+function ensureModelLoaded(slot, model, progressCb){
   if(window.__isFileProtocol){
-    throw new Error("Local AI can't load from a downloaded file (file://) — browsers block this for security. It works automatically once this page is hosted as a real website. Open Settings → Network for the simplest free way to host it.");
+    return Promise.reject(new Error("Local AI can't load from a downloaded file — browsers block this for security. It works automatically once this page is hosted as a real website (https://). Open Settings → Network for the simplest free way to host it."));
   }
-  if(!window.__transformersPromise){
-    window.__transformersPromise=import('https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.0.0').catch(err=>{
-      window.__transformersPromise=null;
-      throw new Error('Could not load the AI library from the CDN. Check your internet connection. ('+err.message+')');
-    });
-  }
-  return window.__transformersPromise;
+  if(aiWorkerLoaded[slot]) return Promise.resolve();
+  aiWorkerProgressCbs[slot]=progressCb||null;
+  const id = ++aiWorkerReqId;
+  return new Promise((resolve,reject)=>{
+    aiWorkerPending[id]={resolve,reject};
+    try{ getAIWorker().postMessage({type:'load', id, slot, model}); }
+    catch(err){ delete aiWorkerPending[id]; reject(new Error('Could not start AI worker: '+err.message)); }
+  });
+}
+function generateInWorker(slot, messages, maxTokens, temperature){
+  const id = ++aiWorkerReqId;
+  return new Promise((resolve,reject)=>{
+    aiWorkerPending[id]={resolve,reject};
+    try{ getAIWorker().postMessage({type:'generate', id, slot, messages, maxTokens, temperature}); }
+    catch(err){ delete aiWorkerPending[id]; reject(new Error('Could not message AI worker: '+err.message)); }
+  });
 }
 
 function openAI1(){
@@ -896,7 +970,7 @@ function openAI1(){
   const html=`
     <div class="chtop">
       <div style="display:flex;align-items:center;gap:8px">
-        <span class="ch-chip">SmolLM2-360M · Local</span>
+        <span class="ch-chip">SmolLM2-360M · Local · Worker thread</span>
         <span class="badge green" id="ai1-status">● Offline-ready</span>
       </div>
       <span onclick="clearChat1()" style="cursor:pointer;font-size:11px;color:var(--t3);font-weight:500">Clear</span>
@@ -913,41 +987,32 @@ function openAI1(){
   if(window.__isFileProtocol){
     addMsg1('ai','⚠️ **This won\'t work right now** because you\'re viewing a downloaded file, and browsers block AI models from loading that way for security.\n\n**The fix doesn\'t need any technical steps from you** — it just needs this page to be hosted as a real website (any free hosting works, e.g. GitHub Pages). Once it\'s opened from a `https://` link instead of a downloaded file, this app works immediately, no setup. See Settings → Network for the simplest option.');
   } else {
-    addMsg1('ai','👋 This is **CheeseBlock Local AI** — a real, small open-weight model (SmolLM2-360M) that downloads once (~190MB) and then runs **entirely on your device**, fully offline, no API key, no account.\n\nFirst message triggers a one-time download. After that it works with no internet at all.\n\nIt\'s genuinely small — good for quick chat and brainstorming, not heavy reasoning.');
+    addMsg1('ai','👋 This is **CheeseBlock Local AI** — a real, small open-weight model (SmolLM2-360M) that downloads once (~190MB) and then runs **entirely on your device**, fully offline, no API key, no account.\n\nIt now runs in a background thread, so your page and computer stay responsive even while it\'s thinking.\n\nFirst message triggers a one-time download. After that it works with no internet at all. It\'s genuinely small — good for quick chat and brainstorming, not heavy reasoning.');
   }
 }
 function setMode1(m){cmode1=m;document.querySelectorAll('#cm1 .chmode').forEach(b=>b.classList.toggle('on',b.textContent===MODES1[m].lbl));addMsg1('sys',`Switched to ${MODES1[m].lbl} mode.`);}
 function addMsg1(role,text){const el=document.getElementById('msgs1');if(!el)return null;const d=document.createElement('div');d.className='cmsg '+({ai:'a',user:'u',sys:'sys'}[role]||role);d.innerHTML=fmtChat(text);el.appendChild(d);el.scrollTop=el.scrollHeight;return d;}
 
-async function ensureLocalModel1(progressCb){
-  if(localAIGenerator1)return localAIGenerator1;
-  const {pipeline}=await ensureTransformers();
-  localAIGenerator1=await pipeline('text-generation','HuggingFaceTB/SmolLM2-360M-Instruct',{dtype:'q4',progress_callback:p=>{if(progressCb)progressCb(p);}});
-  return localAIGenerator1;
-}
 async function sendAI1(){
   const ta=document.getElementById('ta1'),btn=document.getElementById('send1');if(!ta||!btn)return;
   const txt=ta.value.trim();if(!txt)return;ta.value='';ta.style.height='38px';
   addMsg1('user',txt);ch1.push({role:'user',content:txt});
   btn.disabled=true;
   let loadBar=null;
-  if(!localAIGenerator1 && !window.__isFileProtocol){
+  if(!aiWorkerLoaded.ai1 && !window.__isFileProtocol){
     const el=document.getElementById('msgs1');
     loadBar=document.createElement('div');loadBar.className='model-load-bar';
-    loadBar.innerHTML=`<div>⏳ Downloading local AI model (one-time, ~190MB)…</div><div class="model-load-track"><div class="model-load-fill" id="mlf1"></div></div>`;
+    loadBar.innerHTML=`<div>⏳ Downloading local AI model in the background (one-time, ~190MB)… the page stays usable while this happens.</div><div class="model-load-track"><div class="model-load-fill" id="mlf1"></div></div>`;
     el.appendChild(loadBar);el.scrollTop=el.scrollHeight;
   }
   const tk=addMsg1('ai','<span style="opacity:.4;font-style:italic">⏳ Thinking…</span>');
   try{
-    const gen=await ensureLocalModel1(p=>{if(p.status==='progress'&&loadBar){const f=document.getElementById('mlf1');if(f)f.style.width=(p.progress||0)+'%';}});
+    await ensureModelLoaded('ai1','HuggingFaceTB/SmolLM2-360M-Instruct',(p)=>{const f=document.getElementById('mlf1');if(f)f.style.width=p+'%';});
     if(loadBar)loadBar.remove();
     const statusEl=document.getElementById('ai1-status');if(statusEl)statusEl.textContent='● Running locally';
     const sys=MODES1[cmode1]?.sys||MODES1.general.sys;
     const messages=[{role:'system',content:sys},...ch1.slice(-8)];
-    const output=await gen(messages,{max_new_tokens:220,temperature:0.7,do_sample:true});
-    let reply=output[0]?.generated_text;
-    if(Array.isArray(reply))reply=reply[reply.length-1]?.content||'';
-    reply=(reply||'').trim()||'(no output — try rephrasing)';
+    const reply=(await generateInWorker('ai1',messages,220,0.7))||'(no output — try rephrasing)';
     tk.innerHTML=fmtChat(reply);ch1.push({role:'assistant',content:reply});
   }catch(err){
     if(loadBar)loadBar.remove();
@@ -962,7 +1027,7 @@ function openAI2(){
   const html=`
     <div class="chtop">
       <div style="display:flex;align-items:center;gap:8px">
-        <span class="ch-chip">Qwen2.5-Coder-0.5B · Local</span>
+        <span class="ch-chip">Qwen2.5-Coder-0.5B · Local · Worker thread</span>
         <span class="badge green" id="ai2-status">● Offline-ready</span>
       </div>
       <span onclick="clearChat2()" style="cursor:pointer;font-size:11px;color:var(--t3);font-weight:500">Clear</span>
@@ -979,41 +1044,32 @@ function openAI2(){
   if(window.__isFileProtocol){
     addMsg2('ai','⚠️ **This won\'t work right now** because you\'re viewing a downloaded file, and browsers block AI models from loading that way for security.\n\n**The fix doesn\'t need any technical steps from you** — it just needs this page to be hosted as a real website (any free hosting works, e.g. GitHub Pages). Once it\'s opened from a `https://` link instead of a downloaded file, this app works immediately, no setup. See Settings → Network for the simplest option.');
   } else {
-    addMsg2('ai','👋 This is **CheeseBlock Code AI** — a small, real coding-specialized model (Qwen2.5-Coder-0.5B-Instruct) that downloads once (~400MB) then runs **entirely on your device**, offline, no key, no account.\n\nGood for short functions, explaining snippets, and quick fixes. For large/complex codebases it will be noticeably less capable than a full-size hosted model — that\'s the real tradeoff of running locally in a browser tab.');
+    addMsg2('ai','👋 This is **CheeseBlock Code AI** — a small, real coding-specialized model (Qwen2.5-Coder-0.5B-Instruct) that downloads once (~400MB) then runs **entirely on your device**, offline, no key, no account.\n\nIt now runs in a background thread, so your page and computer stay responsive even while it\'s thinking.\n\nGood for short functions, explaining snippets, and quick fixes. For large/complex codebases it will be noticeably less capable than a full-size hosted model — that\'s the real tradeoff of running locally in a browser tab.');
   }
 }
 function setMode2(m){cmode2=m;document.querySelectorAll('#cm2 .chmode').forEach(b=>b.classList.toggle('on',b.textContent===MODES2[m].lbl));addMsg2('sys',`Switched to ${MODES2[m].lbl} mode.`);}
 function addMsg2(role,text){const el=document.getElementById('msgs2');if(!el)return null;const d=document.createElement('div');d.className='cmsg '+({ai:'a',user:'u',sys:'sys'}[role]||role);d.innerHTML=fmtChat(text);el.appendChild(d);el.scrollTop=el.scrollHeight;return d;}
 
-async function ensureLocalModel2(progressCb){
-  if(localAIGenerator2)return localAIGenerator2;
-  const {pipeline}=await ensureTransformers();
-  localAIGenerator2=await pipeline('text-generation','onnx-community/Qwen2.5-Coder-0.5B-Instruct',{dtype:'q4',progress_callback:p=>{if(progressCb)progressCb(p);}});
-  return localAIGenerator2;
-}
 async function sendAI2(){
   const ta=document.getElementById('ta2'),btn=document.getElementById('send2');if(!ta||!btn)return;
   const txt=ta.value.trim();if(!txt)return;ta.value='';ta.style.height='38px';
   addMsg2('user',txt);ch2.push({role:'user',content:txt});
   btn.disabled=true;
   let loadBar=null;
-  if(!localAIGenerator2 && !window.__isFileProtocol){
+  if(!aiWorkerLoaded.ai2 && !window.__isFileProtocol){
     const el=document.getElementById('msgs2');
     loadBar=document.createElement('div');loadBar.className='model-load-bar';
-    loadBar.innerHTML=`<div>⏳ Downloading local coding model (one-time, ~400MB)…</div><div class="model-load-track"><div class="model-load-fill" id="mlf2"></div></div>`;
+    loadBar.innerHTML=`<div>⏳ Downloading local coding model in the background (one-time, ~400MB)… the page stays usable while this happens.</div><div class="model-load-track"><div class="model-load-fill" id="mlf2"></div></div>`;
     el.appendChild(loadBar);el.scrollTop=el.scrollHeight;
   }
   const tk=addMsg2('ai','<span style="opacity:.4;font-style:italic">⏳ Thinking…</span>');
   try{
-    const gen=await ensureLocalModel2(p=>{if(p.status==='progress'&&loadBar){const f=document.getElementById('mlf2');if(f)f.style.width=(p.progress||0)+'%';}});
+    await ensureModelLoaded('ai2','onnx-community/Qwen2.5-Coder-0.5B-Instruct',(p)=>{const f=document.getElementById('mlf2');if(f)f.style.width=p+'%';});
     if(loadBar)loadBar.remove();
     const statusEl=document.getElementById('ai2-status');if(statusEl)statusEl.textContent='● Running locally';
     const sys=MODES2[cmode2]?.sys||MODES2.general.sys;
     const messages=[{role:'system',content:sys},...ch2.slice(-8)];
-    const output=await gen(messages,{max_new_tokens:320,temperature:0.3,do_sample:true});
-    let reply=output[0]?.generated_text;
-    if(Array.isArray(reply))reply=reply[reply.length-1]?.content||'';
-    reply=(reply||'').trim()||'(no output — try rephrasing)';
+    const reply=(await generateInWorker('ai2',messages,320,0.3))||'(no output — try rephrasing)';
     tk.innerHTML=fmtChat(reply);ch2.push({role:'assistant',content:reply});
   }catch(err){
     if(loadBar)loadBar.remove();
@@ -1022,6 +1078,7 @@ async function sendAI2(){
   btn.disabled=false;document.getElementById('ta2')?.focus();
 }
 function clearChat2(){ch2=[];const el=document.getElementById('msgs2');if(el)el.innerHTML='';addMsg2('ai','Cleared. What are you building?');}
+
 
 /* ══════════════════════════════════════════
    📝 NOTES
@@ -1103,45 +1160,207 @@ function fmUp(){const parts=fmCwd.split('/');if(parts.length>1){fmCwd=parts.slic
 function fmNewDir(){const n=prompt('Folder name:');if(n){if(!FS[fmCwd])FS[fmCwd]=[];FS[fmCwd].push(n);FS[fmCwd+'/'+n]=[];renderFM();}}
 
 /* ══════════════════════════════════════════
-   🎵 MUSIC PLAYER (UI demo — no real audio files bundled)
+   🎵 MUSIC — Real Spotify integration (login with your own account)
+   Uses Authorization Code + PKCE (no backend, no client secret needed)
+   then Spotify's official embeddable Player (iFrame API) for playback
+   and the Web API to search/browse the user's own library.
+   NOTE: Spotify requires YOU (the site owner) to register a free
+   Developer app once to get a Client ID — see Settings → Music for setup.
+   Playback works for free accounts via the embed (with ads, like spotify.com);
+   ad-free/gapless playback additionally requires the listener's own Premium.
 ══════════════════════════════════════════ */
-let mpPlaying=false,mpTrackIdx=0;
-const MP_TRACKS=[
-  {title:'Midnight Drive',artist:'Lo-Fi Collective'},
-  {title:'Golden Hour',artist:'Ambient Waves'},
-  {title:'Static Bloom',artist:'Glass Echo'},
-  {title:'Kernel Panic',artist:'Synth Error'},
-];
+let spotifyClientId = localStorage.getItem('cb_spotify_client_id') || '';
+let spotifyAccessToken = sessionStorage.getItem('cb_spotify_token') || '';
+let spotifyTokenExpiry = +(sessionStorage.getItem('cb_spotify_token_exp') || 0);
+let spotifyUser = null;
+let spotifyIframeController = null;
+let spotifyCurrentUri = '';
+
+function spotifyRandomString(len){
+  const possible='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  const values=crypto.getRandomValues(new Uint8Array(len));
+  return Array.from(values).map(v=>possible[v%possible.length]).join('');
+}
+async function spotifySha256(plain){
+  const data=new TextEncoder().encode(plain);
+  return await crypto.subtle.digest('SHA-256',data);
+}
+function spotifyBase64Url(input){
+  return btoa(String.fromCharCode(...new Uint8Array(input))).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+}
+async function spotifyLogin(){
+  if(!spotifyClientId){ alert('Add your Spotify Client ID first — see the setup box in this window.'); return; }
+  const verifier=spotifyRandomString(64);
+  const challenge=spotifyBase64Url(await spotifySha256(verifier));
+  sessionStorage.setItem('cb_spotify_verifier',verifier);
+  const redirectUri=location.origin+location.pathname;
+  const params=new URLSearchParams({
+    client_id:spotifyClientId,
+    response_type:'code',
+    redirect_uri:redirectUri,
+    scope:'user-read-private user-read-email playlist-read-private user-library-read user-top-read',
+    code_challenge_method:'S256',
+    code_challenge:challenge,
+  });
+  window.location.href='https://accounts.spotify.com/authorize?'+params.toString();
+}
+async function spotifyHandleRedirect(){
+  const params=new URLSearchParams(window.location.search);
+  const code=params.get('code');
+  if(!code)return;
+  const verifier=sessionStorage.getItem('cb_spotify_verifier');
+  if(!verifier)return;
+  const clientId=localStorage.getItem('cb_spotify_client_id');
+  if(!clientId)return;
+  const redirectUri=location.origin+location.pathname;
+  try{
+    const resp=await fetch('https://accounts.spotify.com/api/token',{
+      method:'POST',
+      headers:{'Content-Type':'application/x-www-form-urlencoded'},
+      body:new URLSearchParams({
+        client_id:clientId,grant_type:'authorization_code',code,
+        redirect_uri:redirectUri,code_verifier:verifier,
+      })
+    });
+    const data=await resp.json();
+    if(data.access_token){
+      spotifyAccessToken=data.access_token;
+      spotifyTokenExpiry=Date.now()+(data.expires_in*1000);
+      sessionStorage.setItem('cb_spotify_token',spotifyAccessToken);
+      sessionStorage.setItem('cb_spotify_token_exp',spotifyTokenExpiry);
+    }
+  }catch(e){console.warn('Spotify token exchange failed',e);}
+  // clean the URL so the code isn't left visible/reusable
+  window.history.replaceState({},document.title,redirectUri);
+}
+// Run once at load in case we're returning from Spotify's login redirect
+if(new URLSearchParams(window.location.search).get('code')){ spotifyHandleRedirect(); }
+
+async function spotifyFetchMe(){
+  if(!spotifyAccessToken)return null;
+  try{
+    const r=await fetch('https://api.spotify.com/v1/me',{headers:{Authorization:'Bearer '+spotifyAccessToken}});
+    if(!r.ok)return null;
+    return await r.json();
+  }catch{return null;}
+}
+async function spotifySearch(query){
+  if(!spotifyAccessToken||!query)return [];
+  try{
+    const r=await fetch('https://api.spotify.com/v1/search?type=track&limit=10&q='+encodeURIComponent(query),{headers:{Authorization:'Bearer '+spotifyAccessToken}});
+    if(!r.ok)return [];
+    const data=await r.json();
+    return data.tracks?.items||[];
+  }catch{return [];}
+}
+function spotifyLogout(){
+  spotifyAccessToken='';spotifyUser=null;
+  sessionStorage.removeItem('cb_spotify_token');sessionStorage.removeItem('cb_spotify_token_exp');
+  openApp('musicplayer');
+}
+function ensureSpotifyIframeApi(){
+  return new Promise((resolve)=>{
+    if(window.Spotify && window.__spotifyIframeApi){resolve(window.__spotifyIframeApi);return;}
+    window.onSpotifyIframeApiReady=(api)=>{window.__spotifyIframeApi=api;resolve(api);};
+    if(!document.getElementById('spotify-iframe-api-script')){
+      const s=document.createElement('script');
+      s.id='spotify-iframe-api-script';
+      s.src='https://open.spotify.com/embed/iframe-api/v1';
+      document.body.appendChild(s);
+    }
+  });
+}
+
 function openMusicPlayer(){
-  mkWin('musicplayer','Music','musicplayer',320,520,`
-    <div class="mp-art"><svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="#0B0E15" stroke-width="2"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg></div>
-    <div class="mp-title" id="mp-title"></div>
-    <div class="mp-artist" id="mp-artist"></div>
-    <div class="mp-progress" onclick="mpSeek(event)"><div class="mp-progress-fill" id="mp-fill"></div></div>
-    <div class="mp-times"><span id="mp-cur">0:42</span><span>3:15</span></div>
-    <div class="mp-controls">
-      <button class="mp-btn" onclick="mpPrev()"><svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><polygon points="19 20 9 12 19 4"/><rect x="5" y="4" width="2" height="16"/></svg></button>
-      <button class="mp-btn play" id="mp-play-btn" onclick="mpToggle()"><svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" id="mp-play-icon"><polygon points="5 3 19 12 5 21"/></svg></button>
-      <button class="mp-btn" onclick="mpNext()"><svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 4 15 12 5 20"/><rect x="17" y="4" width="2" height="16"/></svg></button>
+  const hasClientId=!!spotifyClientId;
+  const loggedIn=!!spotifyAccessToken;
+  mkWin('musicplayer','Music — Spotify','musicplayer',360,560,`
+    <div style="flex:1;display:flex;flex-direction:column;overflow:hidden">
+      <div style="padding:12px 14px;border-bottom:1px solid var(--b1);display:flex;align-items:center;justify-content:space-between;flex-shrink:0">
+        <span style="font-size:12px;font-weight:600;display:flex;align-items:center;gap:6px"><svg width="16" height="16" viewBox="0 0 24 24" fill="#1DB954"><circle cx="12" cy="12" r="12"/></svg>Spotify</span>
+        <span id="mp-auth-badge" class="badge ${loggedIn?'green':'gray'}">${loggedIn?'Connected':'Not connected'}</span>
+      </div>
+      <div id="mp-body" style="flex:1;overflow-y:auto;padding:14px;display:flex;flex-direction:column;gap:12px"></div>
+    </div>`);
+  renderMusicPlayer();
+}
+
+async function renderMusicPlayer(){
+  const body=document.getElementById('mp-body');if(!body)return;
+  if(!spotifyClientId){
+    body.innerHTML=`
+      <div style="font-size:12px;color:var(--t2);line-height:1.7">
+        <strong style="color:var(--t1)">One-time setup needed</strong> — this needs a free Spotify Developer Client ID before anyone can log in. This is a one-time step for whoever owns this site (not something each listener needs to do).
+      </div>
+      <div style="font-size:11.5px;color:var(--t3);line-height:1.8;background:rgba(245,200,66,.06);border:1px solid rgba(245,200,66,.15);border-radius:9px;padding:12px">
+        1. Go to <strong style="color:var(--t1)">developer.spotify.com/dashboard</strong> and log in<br>
+        2. Click <strong style="color:var(--t1)">Create app</strong><br>
+        3. App name: anything. Redirect URI: paste this exact address —<br>
+        <code style="background:rgba(0,0,0,.3);padding:2px 6px;border-radius:4px;font-size:10px;word-break:break-all;display:inline-block;margin:4px 0">${esc(location.origin+location.pathname)}</code><br>
+        4. Save, open the app, copy the <strong style="color:var(--t1)">Client ID</strong> shown there<br>
+        5. Paste it below
+      </div>
+      <input class="setinput" id="mp-clientid-input" placeholder="Paste Spotify Client ID here">
+      <button class="setbtn" onclick="saveSpotifyClientId()">Save Client ID</button>
+    `;
+    return;
+  }
+  if(!spotifyAccessToken){
+    body.innerHTML=`
+      <div style="font-size:12px;color:var(--t2);line-height:1.6">Client ID is set. Now log in with your own Spotify account to search and play your music.</div>
+      <button class="setbtn" style="background:#1DB954;color:#fff" onclick="spotifyLogin()">Log in with Spotify</button>
+      <div style="font-size:10.5px;color:var(--t3);line-height:1.6">Playback uses Spotify's official embedded player. Free accounts hear occasional ads, same as on spotify.com; Premium accounts get ad-free playback automatically once logged in.</div>
+    `;
+    return;
+  }
+  if(!spotifyUser){ spotifyUser=await spotifyFetchMe(); }
+  body.innerHTML=`
+    <div style="display:flex;align-items:center;gap:10px">
+      <div style="width:36px;height:36px;border-radius:50%;background:#1DB954;display:flex;align-items:center;justify-content:center;font-weight:700;color:#000;flex-shrink:0">${esc((spotifyUser?.display_name||'S')[0])}</div>
+      <div style="flex:1;overflow:hidden">
+        <div style="font-size:12px;font-weight:600;color:var(--t1);overflow:hidden;text-overflow:ellipsis">${esc(spotifyUser?.display_name||'Spotify User')}</div>
+        <div style="font-size:10px;color:var(--t3)">${esc(spotifyUser?.product==='premium'?'Premium':'Free plan')}</div>
+      </div>
+      <button class="setbtn ghost" style="font-size:10px;padding:5px 10px" onclick="spotifyLogout()">Log out</button>
     </div>
-    <div class="mp-list" id="mp-list"></div>`);
-  renderMP();
+    <input class="setinput" id="mp-search-input" placeholder="Search a song, artist, or album…" style="margin-top:0" onkeydown="if(event.key==='Enter')spotifyDoSearch()">
+    <div id="mp-search-results" style="display:flex;flex-direction:column;gap:2px"></div>
+    <div id="mp-player-mount" style="margin-top:auto;flex-shrink:0"></div>
+  `;
 }
-function renderMP(){
-  const t=MP_TRACKS[mpTrackIdx];
-  const titleEl=document.getElementById('mp-title');if(titleEl)titleEl.textContent=t.title;
-  const artistEl=document.getElementById('mp-artist');if(artistEl)artistEl.textContent=t.artist;
-  const list=document.getElementById('mp-list');
-  if(list)list.innerHTML=MP_TRACKS.map((tr,i)=>`<div class="mp-track${i===mpTrackIdx?' on':''}" onclick="mpTrackIdx=${i};renderMP()"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>${esc(tr.title)} — ${esc(tr.artist)}</div>`).join('');
+function saveSpotifyClientId(){
+  const inp=document.getElementById('mp-clientid-input');if(!inp)return;
+  const v=inp.value.trim();if(!v)return;
+  spotifyClientId=v;localStorage.setItem('cb_spotify_client_id',v);
+  renderMusicPlayer();
 }
-function mpToggle(){
-  mpPlaying=!mpPlaying;
-  const icon=document.getElementById('mp-play-icon');
-  if(icon)icon.innerHTML=mpPlaying?'<rect x="5" y="4" width="5" height="16"/><rect x="14" y="4" width="5" height="16"/>':'<polygon points="5 3 19 12 5 21"/>';
+async function spotifyDoSearch(){
+  const inp=document.getElementById('mp-search-input');if(!inp)return;
+  const q=inp.value.trim();if(!q)return;
+  const results=document.getElementById('mp-search-results');
+  if(results)results.innerHTML='<div style="font-size:11px;color:var(--t3);padding:8px">Searching…</div>';
+  const tracks=await spotifySearch(q);
+  if(!results)return;
+  if(!tracks.length){results.innerHTML='<div style="font-size:11px;color:var(--t3);padding:8px">No results</div>';return;}
+  results.innerHTML=tracks.map(t=>`
+    <div class="mp-track" onclick="spotifyPlay('${t.uri}')" style="padding:8px 6px">
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>
+      <div style="overflow:hidden;flex:1">
+        <div style="font-size:12px;color:var(--t1);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(t.name)}</div>
+        <div style="font-size:10px;color:var(--t3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(t.artists?.map(a=>a.name).join(', ')||'')}</div>
+      </div>
+    </div>`).join('');
 }
-function mpNext(){mpTrackIdx=(mpTrackIdx+1)%MP_TRACKS.length;renderMP();}
-function mpPrev(){mpTrackIdx=(mpTrackIdx-1+MP_TRACKS.length)%MP_TRACKS.length;renderMP();}
-function mpSeek(e){const r=e.currentTarget.getBoundingClientRect();const pct=((e.clientX-r.left)/r.width)*100;const f=document.getElementById('mp-fill');if(f)f.style.width=pct+'%';}
+async function spotifyPlay(uri){
+  spotifyCurrentUri=uri;
+  const mount=document.getElementById('mp-player-mount');if(!mount)return;
+  mount.innerHTML='<div id="spotify-embed-target" style="border-radius:10px;overflow:hidden"></div>';
+  const api=await ensureSpotifyIframeApi();
+  const el=document.getElementById('spotify-embed-target');
+  api.createController(el,{uri,width:'100%',height:'80'},(controller)=>{
+    spotifyIframeController=controller;
+  });
+}
 
 /* ══════════════════════════════════════════
    🖼️ IMAGE GALLERY (placeholder swatches — no bundled images)
@@ -1222,7 +1441,13 @@ const SETT={
   ai:()=>`<div class="setlbl">AI Assistants</div>
     <div class="setr"><div><div class="setrt">Local AI (General)</div><div class="setrs">SmolLM2-360M via Transformers.js — offline, free, no key</div></div><span class="badge green">Always free</span></div>
     <div class="setr"><div><div class="setrt">Code AI</div><div class="setrs">Qwen2.5-Coder-0.5B via Transformers.js — offline, free, no key</div></div><span class="badge green">Always free</span></div>
-    <div class="setr"><div><div class="setrt">Runtime requirement</div><div class="setrs">Needs a real website address — won't load from a downloaded file</div></div><span class="badge ${window.__isFileProtocol?'red':'green'}">${window.__isFileProtocol?'Blocked now':'OK'}</span></div>`,
+    <div class="setr"><div><div class="setrt">Runtime requirement</div><div class="setrs">Needs a real website address — won't load from a downloaded file</div></div><span class="badge ${window.__isFileProtocol?'red':'green'}">${window.__isFileProtocol?'Blocked now':'OK'}</span></div>
+    <div class="setr"><div><div class="setrt">Background thread</div><div class="setrs">Both models run in a Web Worker so the page never freezes</div></div><span class="badge green">Active</span></div>`,
+  music:()=>`<div class="setlbl">Music — Spotify</div>
+    <div class="setr"><div><div class="setrt">Client ID</div><div class="setrs">${spotifyClientId?'Configured':'Not set — open the Music app to set it up'}</div></div><span class="badge ${spotifyClientId?'green':'gray'}">${spotifyClientId?'Set':'Missing'}</span></div>
+    <div class="setr"><div><div class="setrt">Account</div><div class="setrs">${spotifyAccessToken?'Logged in':'Each listener logs in with their own Spotify account from the Music app'}</div></div><span class="badge ${spotifyAccessToken?'green':'gray'}">${spotifyAccessToken?'Connected':'Not connected'}</span></div>
+    ${spotifyClientId?`<div class="setr"><div><div class="setrt">Reset Client ID</div><div class="setrs">Remove the saved Spotify app credentials</div></div><button class="setbtn danger" onclick="if(confirm('Remove saved Spotify Client ID?')){spotifyClientId='';localStorage.removeItem('cb_spotify_client_id');spotifyLogout();}">Remove</button></div>`:''}
+    <div style="margin-top:10px;font-size:11px;color:var(--t3);line-height:1.7">Playback uses Spotify's official embedded player. Free Spotify accounts hear occasional ads (same as spotify.com); Premium accounts get ad-free playback automatically. This never stores passwords — login happens directly on Spotify's own site.</div>`,
   privacy:()=>`<div class="setlbl">Privacy & Security</div>
     <div class="setr"><div><div class="setrt">Ad Blocker</div><div class="setrs">Block ads in the browser</div></div><div class="tog on" onclick="this.classList.toggle('on')"></div></div>
     <div class="setr"><div><div class="setrt">Do Not Track</div><div class="setrs">Send DNT header</div></div><div class="tog on" onclick="this.classList.toggle('on')"></div></div>
@@ -1272,21 +1497,63 @@ function openSettings(){
 function switchSett(tab){settTab=tab;const p=document.getElementById('setp');if(p)p.innerHTML=SETT[tab]?.()??'';document.querySelectorAll('.sni').forEach((el,i)=>el.classList.toggle('on',['display','sound','ai','privacy','network','about'][i]===tab));}
 
 /* ══════════════════════════════════════════
-   🖼️ WALLPAPER
+   🖼️ WALLPAPER — distinctive gradient art + custom image URL
 ══════════════════════════════════════════ */
 const WPS=[
-  {id:'default',label:'Void',c:['#07090D','#0B0E15','#10141E']},
-  {id:'aurora', label:'Aurora',c:['#050c14','#062516','#08051a']},
-  {id:'ember',  label:'Ember', c:['#0d0400','#1a0800','#0a0205']},
-  {id:'ocean',  label:'Ocean', c:['#010912','#011a2e','#01100a']},
-  {id:'amethyst',label:'Amethyst',c:['#0a0514','#14052a','#050a14']},
-  {id:'slate',  label:'Slate', c:['#080b10','#0e131a','#111820']},
+  {id:'default', label:'Void',     css:'radial-gradient(circle at 20% 20%, #1a1f2e 0%, #07090D 50%), linear-gradient(135deg,#07090D,#0B0E15,#10141E)'},
+  {id:'aurora',  label:'Aurora',   css:'radial-gradient(ellipse at 70% 10%, rgba(61,220,132,.25) 0%, transparent 45%), radial-gradient(ellipse at 20% 80%, rgba(78,158,255,.2) 0%, transparent 50%), linear-gradient(160deg,#020608,#04140f,#020812)'},
+  {id:'sunset',  label:'Sunset',   css:'linear-gradient(160deg,#1a0a05 0%,#3d1505 30%,#7a2a0a 55%,#f5c842 100%)'},
+  {id:'ocean',   label:'Ocean',    css:'radial-gradient(ellipse at 50% 100%, rgba(20,120,180,.35) 0%, transparent 60%), linear-gradient(180deg,#010912,#011a2e,#012a40)'},
+  {id:'amethyst',label:'Amethyst', css:'radial-gradient(circle at 80% 20%, rgba(167,139,250,.3) 0%, transparent 50%), linear-gradient(150deg,#0a0514,#1a0a2e,#0d0520)'},
+  {id:'nebula',  label:'Nebula',   css:'radial-gradient(ellipse at 30% 30%, rgba(245,200,66,.18) 0%, transparent 45%), radial-gradient(ellipse at 75% 75%, rgba(255,85,87,.15) 0%, transparent 50%), linear-gradient(135deg,#050308,#0d0818,#08050f)'},
+  {id:'slate',   label:'Slate',    css:'linear-gradient(160deg,#080b10,#0e131a,#111820)'},
+  {id:'forest',  label:'Forest',   css:'radial-gradient(ellipse at 50% 0%, rgba(61,220,132,.15) 0%, transparent 50%), linear-gradient(180deg,#03110a,#051a0f,#020a06)'},
+  {id:'custom',  label:'Custom Image', css:null},
 ];
 function openWallpaper(){
-  const thumbs=WPS.map(w=>`<div class="wpt${currentWP===w.id?' on':''}" style="background:linear-gradient(135deg,${w.c.join(',')})" onclick="applyWP('${w.id}');document.querySelectorAll('.wpt').forEach(t=>t.classList.remove('on'));this.classList.add('on')"><span class="wpt-label">${w.label}</span></div>`).join('');
-  mkWin('wallpaper','Wallpaper','wallpaper',420,300,`<div style="padding:18px"><div class="setlbl" style="margin-bottom:10px">Choose Wallpaper Theme</div><div class="wpg">${thumbs}</div><div style="margin-top:16px;font-size:11px;color:var(--t3);line-height:1.6">Wallpapers are dark colour themes. The animated app-icon canvas and desktop app icons always sit above them.</div></div>`);
+  const customUrl=localStorage.getItem('cb_wp_custom_url')||'';
+  const thumbs=WPS.map(w=>{
+    if(w.id==='custom'){
+      const bg=customUrl?`url('${customUrl}') center/cover`:'repeating-linear-gradient(45deg,#222 0,#222 10px,#1a1a1a 10px,#1a1a1a 20px)';
+      return `<div class="wpt${currentWP===w.id?' on':''}" style="background:${bg}" onclick="document.getElementById('wp-custom-row').style.display='flex'" title="${w.label}"><span class="wpt-label">${w.label}</span></div>`;
+    }
+    return `<div class="wpt${currentWP===w.id?' on':''}" style="background:${w.css}" onclick="applyWP('${w.id}');document.querySelectorAll('.wpt').forEach(t=>t.classList.remove('on'));this.classList.add('on')" title="${w.label}"><span class="wpt-label">${w.label}</span></div>`;
+  }).join('');
+  mkWin('wallpaper','Wallpaper','wallpaper',440,420,`<div style="padding:18px;overflow-y:auto">
+    <div class="setlbl" style="margin-bottom:10px">Choose Wallpaper</div>
+    <div class="wpg">${thumbs}</div>
+    <div id="wp-custom-row" style="display:${currentWP==='custom'?'flex':'none'};gap:6px;margin-top:14px;">
+      <input class="setinput" id="wp-custom-input" placeholder="Paste an image URL (https://...)" value="${esc(customUrl)}" style="margin-top:0">
+      <button class="setbtn" onclick="applyCustomWP()">Apply</button>
+    </div>
+    <div style="margin-top:16px;font-size:11px;color:var(--t3);line-height:1.6">The animated app-icon canvas and desktop app icons always sit above the wallpaper. Custom Image accepts any direct image link ending in .jpg, .png, .webp, etc.</div>
+  </div>`);
 }
-function applyWP(id){currentWP=id;const w=WPS.find(x=>x.id===id);if(!w)return;document.getElementById('desk').style.background=`linear-gradient(135deg,${w.c.join(',')})`;localStorage.setItem('cb_wp6',id);}
+function applyWP(id){
+  currentWP=id;const w=WPS.find(x=>x.id===id);if(!w||!w.css)return;
+  document.getElementById('desk').style.backgroundImage='none';
+  document.getElementById('desk').style.background=w.css;
+  localStorage.setItem('cb_wp6',id);
+}
+function applyCustomWP(){
+  const input=document.getElementById('wp-custom-input');if(!input)return;
+  const url=input.value.trim();if(!url)return;
+  currentWP='custom';
+  localStorage.setItem('cb_wp_custom_url',url);
+  localStorage.setItem('cb_wp6','custom');
+  const desk=document.getElementById('desk');
+  desk.style.background=`url('${url}') center/cover no-repeat`;
+  document.querySelectorAll('.wpt').forEach(t=>t.classList.remove('on'));
+  const customThumb=document.querySelector('.wpt[title="Custom Image"]');
+  if(customThumb){customThumb.classList.add('on');customThumb.style.background=`url('${url}') center/cover`;}
+}
+function applyInitialWallpaper(){
+  if(currentWP==='custom'){
+    const url=localStorage.getItem('cb_wp_custom_url');
+    if(url){document.getElementById('desk').style.background=`url('${url}') center/cover no-repeat`;return;}
+  }
+  applyWP(currentWP);
+}
 </script>
 </body>
 </html>
