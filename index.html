@@ -2108,7 +2108,7 @@ function timerStart(){
     timerRunning=true;
     timerInterval=setInterval(()=>{
       timerSeconds--;timerUpdateDisplay();
-      if(timerSeconds<=0){clearInterval(timerInterval);timerRunning=false;const d=document.getElementById('timer-display');if(d)d.style.color='var(--red)';alert('⏰ Time\\'s up!');}
+      if(timerSeconds<=0){clearInterval(timerInterval);timerRunning=false;const d=document.getElementById('timer-display');if(d)d.style.color='var(--red)';alert("⏰ Time's up!");}
     },1000);
   } else {
     timerRunning=true;stopwatchStart=Date.now()-stopwatchMs;
