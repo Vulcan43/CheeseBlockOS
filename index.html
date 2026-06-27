@@ -847,10 +847,10 @@ function fmtChat(t){
 }
 
 /* ══════════════════════════════════════════
-   🌐 BROWSER — proxy via corsproxy.io + allorigins.win fallback
+   🌐 BROWSER — proxy via codetabs.com + allorigins.win fallback
    NOTE: requires http:// or https:// origin (won't work from file://)
 ══════════════════════════════════════════ */
-const PROXY1=url=>`https://corsproxy.io/?url=${encodeURIComponent(url)}`;
+const PROXY1=url=>`https://api.codetabs.com/v1/proxy/?quest=${encodeURIComponent(url)}`;
 const PROXY2=url=>`https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`;
 let currentProxy='1';
 function setProxy(v){currentProxy=v;}
@@ -897,7 +897,7 @@ function renderBrowser(){
       <span class="sdot"></span>
       <span id="brstlbl" style="color:var(--t3)">CheeseBlock Proxy</span>
       <select class="proxy-select" id="proxysel" onchange="setProxy(this.value)" style="margin-left:6px">
-        <option value="1">corsproxy.io</option>
+        <option value="1">codetabs.com</option>
         <option value="2">allorigins.win</option>
         <option value="direct">Direct (may fail)</option>
       </select>
@@ -938,8 +938,8 @@ async function loadBrowserTab(idx,url,isSearch){
   try{
     if(currentProxy==='direct'){if(loading)loading.classList.add('hide');if(frame){frame.style.display='block';frame.src=url;}if(stat)stat.textContent='Direct load (may be blocked by site)';renderBrowTabs();return;}
     const proxyUrl=currentProxy==='1'?PROXY1(url):PROXY2(url);
-    if(lbl)lbl.textContent=`Using ${currentProxy==='1'?'corsproxy.io':'allorigins.win'}…`;
-    if(stat)stat.textContent=`Proxy: ${currentProxy==='1'?'corsproxy.io':'allorigins.win'}`;
+    if(lbl)lbl.textContent=`Using ${currentProxy==='1'?'codetabs.com':'allorigins.win'}…`;
+    if(stat)stat.textContent=`Proxy: ${currentProxy==='1'?'codetabs.com':'allorigins.win'}`;
     const resp=await fetch(proxyUrl,{signal:AbortSignal.timeout(12000)});
     if(!resp.ok)throw new Error('Proxy returned '+resp.status);
     let html=await resp.text();
@@ -1048,8 +1048,22 @@ const aiWorkerPending = {};
 const aiWorkerLoaded = { ai1:false, ai2:false };
 const aiWorkerProgressCbs = { ai1:null, ai2:null };
 
+function destroyAIWorker(errMsg){
+  // Reset everything so the NEXT attempt creates a fresh worker instead of
+  // silently talking to a dead one. This was the root cause of "AI just
+  // doesn't respond" with no error after a worker failed once.
+  Object.values(aiWorkerPending).forEach(p=>p.reject(new Error(errMsg||'AI worker stopped unexpectedly.')));
+  Object.keys(aiWorkerPending).forEach(k=>delete aiWorkerPending[k]);
+  if(aiWorker){ try{ aiWorker.terminate(); }catch(e){} }
+  aiWorker=null;
+  aiWorkerLoaded.ai1=false; aiWorkerLoaded.ai2=false;
+}
+
 function getAIWorker(){
   if(aiWorker) return aiWorker;
+  if(!('Worker' in window)){
+    throw new Error('Your browser does not support Web Workers, which the local AI needs to run without freezing the page.');
+  }
   const blob = new Blob([AI_WORKER_SRC], {type:'application/javascript'});
   const blobUrl = URL.createObjectURL(blob);
   aiWorker = new Worker(blobUrl, {type:'module'});
@@ -1067,7 +1081,9 @@ function getAIWorker(){
     else if(type==='error'){ pending.reject(new Error(message)); }
   };
   aiWorker.onerror = (e)=>{
-    Object.values(aiWorkerPending).forEach(p=>p.reject(new Error('Worker crashed: '+(e.message||'unknown error'))));
+    e.preventDefault?.();
+    const msg = e?.message || 'The AI worker crashed unexpectedly — this is usually caused by the model library failing to load from the CDN (network issue) or the device running out of memory.';
+    destroyAIWorker(msg);
   };
   return aiWorker;
 }
@@ -1080,17 +1096,39 @@ function ensureModelLoaded(slot, model, progressCb){
   aiWorkerProgressCbs[slot]=progressCb||null;
   const id = ++aiWorkerReqId;
   return new Promise((resolve,reject)=>{
-    aiWorkerPending[id]={resolve,reject};
+    // Safety timeout: if the worker never responds (e.g. import() inside it
+    // hung silently), fail loudly after 90s instead of leaving the UI stuck
+    // on "Thinking..." forever with no way to retry.
+    const timeoutId=setTimeout(()=>{
+      if(aiWorkerPending[id]){
+        delete aiWorkerPending[id];
+        destroyAIWorker('Timed out loading the model after 90 seconds. This usually means the CDN (jsdelivr) is unreachable or blocked on your network.');
+        reject(new Error('Timed out loading the model after 90 seconds — the worker has been reset, try sending your message again.'));
+      }
+    },90000);
+    aiWorkerPending[id]={
+      resolve:(v)=>{clearTimeout(timeoutId);resolve(v);},
+      reject:(e)=>{clearTimeout(timeoutId);reject(e);},
+    };
     try{ getAIWorker().postMessage({type:'load', id, slot, model}); }
-    catch(err){ delete aiWorkerPending[id]; reject(new Error('Could not start AI worker: '+err.message)); }
+    catch(err){ delete aiWorkerPending[id]; clearTimeout(timeoutId); reject(new Error('Could not start AI worker: '+err.message)); }
   });
 }
 function generateInWorker(slot, messages, maxTokens, temperature){
   const id = ++aiWorkerReqId;
   return new Promise((resolve,reject)=>{
-    aiWorkerPending[id]={resolve,reject};
+    const timeoutId=setTimeout(()=>{
+      if(aiWorkerPending[id]){
+        delete aiWorkerPending[id];
+        reject(new Error('The model took too long to respond (over 60s). Try a shorter message.'));
+      }
+    },60000);
+    aiWorkerPending[id]={
+      resolve:(v)=>{clearTimeout(timeoutId);resolve(v);},
+      reject:(e)=>{clearTimeout(timeoutId);reject(e);},
+    };
     try{ getAIWorker().postMessage({type:'generate', id, slot, messages, maxTokens, temperature}); }
-    catch(err){ delete aiWorkerPending[id]; reject(new Error('Could not message AI worker: '+err.message)); }
+    catch(err){ delete aiWorkerPending[id]; clearTimeout(timeoutId); reject(new Error('Could not message AI worker: '+err.message)); }
   });
 }
 
@@ -1116,7 +1154,7 @@ function openAI1(){
   if(window.__isFileProtocol){
     addMsg1('ai','⚠️ **This won\'t work right now** because you\'re viewing a downloaded file, and browsers block AI models from loading that way for security.\n\n**The fix doesn\'t need any technical steps from you** — it just needs this page to be hosted as a real website (any free hosting works, e.g. GitHub Pages). Once it\'s opened from a `https://` link instead of a downloaded file, this app works immediately, no setup. See Settings → Network for the simplest option.');
   } else {
-    addMsg1('ai','👋 This is **CheeseBlock Local AI** — a real, small open-weight model (SmolLM2-360M) that downloads once (~190MB) and then runs **entirely on your device**, fully offline, no API key, no account.\n\nIt now runs in a background thread, so your page and computer stay responsive even while it\'s thinking.\n\nFirst message triggers a one-time download. After that it works with no internet at all. It\'s genuinely small — good for quick chat and brainstorming, not heavy reasoning.');
+    addMsg1('ai','👋 This is **CheeseBlock Local AI** — a real, small open-weight model (SmolLM2-360M) that loads straight into your browser\'s memory/cache (~190MB) and runs **entirely on your device** from there. Nothing is saved to your computer as a file — there is nothing to install and nothing to find in your Downloads folder.\n\nIt runs in a background thread, so your page and computer stay responsive even while it\'s thinking.\n\nFirst message triggers that one-time browser cache load. After that it works with no internet at all (until you clear your browser cache). It\'s genuinely small — good for quick chat and brainstorming, not heavy reasoning.');
   }
 }
 function setMode1(m){cmode1=m;document.querySelectorAll('#cm1 .chmode').forEach(b=>b.classList.toggle('on',b.textContent===MODES1[m].lbl));addMsg1('sys',`Switched to ${MODES1[m].lbl} mode.`);}
@@ -1131,7 +1169,7 @@ async function sendAI1(){
   if(!aiWorkerLoaded.ai1 && !window.__isFileProtocol){
     const el=document.getElementById('msgs1');
     loadBar=document.createElement('div');loadBar.className='model-load-bar';
-    loadBar.innerHTML=`<div>⏳ Downloading local AI model in the background (one-time, ~190MB)… the page stays usable while this happens.</div><div class="model-load-track"><div class="model-load-fill" id="mlf1"></div></div>`;
+    loadBar.innerHTML=`<div>⏳ Loading AI model into browser memory (one-time, ~190MB, nothing saved to your PC)… the page stays usable while this happens.</div><div class="model-load-track"><div class="model-load-fill" id="mlf1"></div></div>`;
     el.appendChild(loadBar);el.scrollTop=el.scrollHeight;
   }
   const tk=addMsg1('ai','<span style="opacity:.4;font-style:italic">⏳ Thinking…</span>');
@@ -1145,7 +1183,8 @@ async function sendAI1(){
     tk.innerHTML=fmtChat(reply);ch1.push({role:'assistant',content:reply});
   }catch(err){
     if(loadBar)loadBar.remove();
-    tk.innerHTML=fmtChat(`⚠️ **Local model error:** ${err.message}`);
+    const statusEl=document.getElementById('ai1-status');if(statusEl){statusEl.textContent='● Error — retry below';statusEl.className='badge red';}
+    tk.innerHTML=fmtChat(`⚠️ **Local model error:** ${err.message}\n\n*The AI has been reset — just send another message to try again.*`);
   }
   btn.disabled=false;document.getElementById('ta1')?.focus();
 }
@@ -1173,7 +1212,7 @@ function openAI2(){
   if(window.__isFileProtocol){
     addMsg2('ai','⚠️ **This won\'t work right now** because you\'re viewing a downloaded file, and browsers block AI models from loading that way for security.\n\n**The fix doesn\'t need any technical steps from you** — it just needs this page to be hosted as a real website (any free hosting works, e.g. GitHub Pages). Once it\'s opened from a `https://` link instead of a downloaded file, this app works immediately, no setup. See Settings → Network for the simplest option.');
   } else {
-    addMsg2('ai','👋 This is **CheeseBlock Code AI** — a small, real coding-specialized model (Qwen2.5-Coder-0.5B-Instruct) that downloads once (~400MB) then runs **entirely on your device**, offline, no key, no account.\n\nIt now runs in a background thread, so your page and computer stay responsive even while it\'s thinking.\n\nGood for short functions, explaining snippets, and quick fixes. For large/complex codebases it will be noticeably less capable than a full-size hosted model — that\'s the real tradeoff of running locally in a browser tab.');
+    addMsg2('ai','👋 This is **CheeseBlock Code AI** — a small, real coding-specialized model (Qwen2.5-Coder-0.5B-Instruct) that loads straight into your browser\'s memory/cache (~400MB) and runs **entirely on your device** from there. Nothing is saved to your computer as a file — there is nothing to install and nothing to find in your Downloads folder.\n\nIt runs in a background thread, so your page and computer stay responsive even while it\'s thinking.\n\nGood for short functions, explaining snippets, and quick fixes. For large/complex codebases it will be noticeably less capable than a full-size hosted model — that\'s the real tradeoff of running locally in a browser tab.');
   }
 }
 function setMode2(m){cmode2=m;document.querySelectorAll('#cm2 .chmode').forEach(b=>b.classList.toggle('on',b.textContent===MODES2[m].lbl));addMsg2('sys',`Switched to ${MODES2[m].lbl} mode.`);}
@@ -1188,7 +1227,7 @@ async function sendAI2(){
   if(!aiWorkerLoaded.ai2 && !window.__isFileProtocol){
     const el=document.getElementById('msgs2');
     loadBar=document.createElement('div');loadBar.className='model-load-bar';
-    loadBar.innerHTML=`<div>⏳ Downloading local coding model in the background (one-time, ~400MB)… the page stays usable while this happens.</div><div class="model-load-track"><div class="model-load-fill" id="mlf2"></div></div>`;
+    loadBar.innerHTML=`<div>⏳ Loading coding AI model into browser memory (one-time, ~400MB, nothing saved to your PC)… the page stays usable while this happens.</div><div class="model-load-track"><div class="model-load-fill" id="mlf2"></div></div>`;
     el.appendChild(loadBar);el.scrollTop=el.scrollHeight;
   }
   const tk=addMsg2('ai','<span style="opacity:.4;font-style:italic">⏳ Thinking…</span>');
@@ -1202,7 +1241,8 @@ async function sendAI2(){
     tk.innerHTML=fmtChat(reply);ch2.push({role:'assistant',content:reply});
   }catch(err){
     if(loadBar)loadBar.remove();
-    tk.innerHTML=fmtChat(`⚠️ **Local model error:** ${err.message}`);
+    const statusEl=document.getElementById('ai2-status');if(statusEl){statusEl.textContent='● Error — retry below';statusEl.className='badge red';}
+    tk.innerHTML=fmtChat(`⚠️ **Local model error:** ${err.message}\n\n*The AI has been reset — just send another message to try again.*`);
   }
   btn.disabled=false;document.getElementById('ta2')?.focus();
 }
@@ -1289,209 +1329,6 @@ function fmUp(){const parts=fmCwd.split('/');if(parts.length>1){fmCwd=parts.slic
 function fmNewDir(){const n=prompt('Folder name:');if(n){if(!FS[fmCwd])FS[fmCwd]=[];FS[fmCwd].push(n);FS[fmCwd+'/'+n]=[];renderFM();}}
 
 /* ══════════════════════════════════════════
-   🎵 MUSIC — Real Spotify integration (login with your own account)
-   Uses Authorization Code + PKCE (no backend, no client secret needed)
-   then Spotify's official embeddable Player (iFrame API) for playback
-   and the Web API to search/browse the user's own library.
-   NOTE: Spotify requires YOU (the site owner) to register a free
-   Developer app once to get a Client ID — see Settings → Music for setup.
-   Playback works for free accounts via the embed (with ads, like spotify.com);
-   ad-free/gapless playback additionally requires the listener's own Premium.
-══════════════════════════════════════════ */
-let spotifyClientId = localStorage.getItem('cb_spotify_client_id') || '';
-let spotifyAccessToken = sessionStorage.getItem('cb_spotify_token') || '';
-let spotifyTokenExpiry = +(sessionStorage.getItem('cb_spotify_token_exp') || 0);
-let spotifyUser = null;
-let spotifyIframeController = null;
-let spotifyCurrentUri = '';
-
-function spotifyRandomString(len){
-  const possible='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-  const values=crypto.getRandomValues(new Uint8Array(len));
-  return Array.from(values).map(v=>possible[v%possible.length]).join('');
-}
-async function spotifySha256(plain){
-  const data=new TextEncoder().encode(plain);
-  return await crypto.subtle.digest('SHA-256',data);
-}
-function spotifyBase64Url(input){
-  return btoa(String.fromCharCode(...new Uint8Array(input))).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
-}
-async function spotifyLogin(){
-  if(!spotifyClientId){ alert('Add your Spotify Client ID first — see the setup box in this window.'); return; }
-  const verifier=spotifyRandomString(64);
-  const challenge=spotifyBase64Url(await spotifySha256(verifier));
-  sessionStorage.setItem('cb_spotify_verifier',verifier);
-  const redirectUri=location.origin+location.pathname;
-  const params=new URLSearchParams({
-    client_id:spotifyClientId,
-    response_type:'code',
-    redirect_uri:redirectUri,
-    scope:'user-read-private user-read-email playlist-read-private user-library-read user-top-read',
-    code_challenge_method:'S256',
-    code_challenge:challenge,
-  });
-  window.location.href='https://accounts.spotify.com/authorize?'+params.toString();
-}
-async function spotifyHandleRedirect(){
-  const params=new URLSearchParams(window.location.search);
-  const code=params.get('code');
-  if(!code)return;
-  const verifier=sessionStorage.getItem('cb_spotify_verifier');
-  if(!verifier)return;
-  const clientId=localStorage.getItem('cb_spotify_client_id');
-  if(!clientId)return;
-  const redirectUri=location.origin+location.pathname;
-  try{
-    const resp=await fetch('https://accounts.spotify.com/api/token',{
-      method:'POST',
-      headers:{'Content-Type':'application/x-www-form-urlencoded'},
-      body:new URLSearchParams({
-        client_id:clientId,grant_type:'authorization_code',code,
-        redirect_uri:redirectUri,code_verifier:verifier,
-      })
-    });
-    const data=await resp.json();
-    if(data.access_token){
-      spotifyAccessToken=data.access_token;
-      spotifyTokenExpiry=Date.now()+(data.expires_in*1000);
-      sessionStorage.setItem('cb_spotify_token',spotifyAccessToken);
-      sessionStorage.setItem('cb_spotify_token_exp',spotifyTokenExpiry);
-    }
-  }catch(e){console.warn('Spotify token exchange failed',e);}
-  // clean the URL so the code isn't left visible/reusable
-  window.history.replaceState({},document.title,redirectUri);
-}
-// Run once at load in case we're returning from Spotify's login redirect
-if(new URLSearchParams(window.location.search).get('code')){ spotifyHandleRedirect(); }
-
-async function spotifyFetchMe(){
-  if(!spotifyAccessToken)return null;
-  try{
-    const r=await fetch('https://api.spotify.com/v1/me',{headers:{Authorization:'Bearer '+spotifyAccessToken}});
-    if(!r.ok)return null;
-    return await r.json();
-  }catch{return null;}
-}
-async function spotifySearch(query){
-  if(!spotifyAccessToken||!query)return [];
-  try{
-    const r=await fetch('https://api.spotify.com/v1/search?type=track&limit=10&q='+encodeURIComponent(query),{headers:{Authorization:'Bearer '+spotifyAccessToken}});
-    if(!r.ok)return [];
-    const data=await r.json();
-    return data.tracks?.items||[];
-  }catch{return [];}
-}
-function spotifyLogout(){
-  spotifyAccessToken='';spotifyUser=null;
-  sessionStorage.removeItem('cb_spotify_token');sessionStorage.removeItem('cb_spotify_token_exp');
-  openApp('musicplayer');
-}
-function ensureSpotifyIframeApi(){
-  return new Promise((resolve)=>{
-    if(window.Spotify && window.__spotifyIframeApi){resolve(window.__spotifyIframeApi);return;}
-    window.onSpotifyIframeApiReady=(api)=>{window.__spotifyIframeApi=api;resolve(api);};
-    if(!document.getElementById('spotify-iframe-api-script')){
-      const s=document.createElement('script');
-      s.id='spotify-iframe-api-script';
-      s.src='https://open.spotify.com/embed/iframe-api/v1';
-      document.body.appendChild(s);
-    }
-  });
-}
-
-function openMusicPlayer(){
-  const hasClientId=!!spotifyClientId;
-  const loggedIn=!!spotifyAccessToken;
-  mkWin('musicplayer','Music — Spotify','musicplayer',360,560,`
-    <div style="flex:1;display:flex;flex-direction:column;overflow:hidden">
-      <div style="padding:12px 14px;border-bottom:1px solid var(--b1);display:flex;align-items:center;justify-content:space-between;flex-shrink:0">
-        <span style="font-size:12px;font-weight:600;display:flex;align-items:center;gap:6px"><svg width="16" height="16" viewBox="0 0 24 24" fill="#1DB954"><circle cx="12" cy="12" r="12"/></svg>Spotify</span>
-        <span id="mp-auth-badge" class="badge ${loggedIn?'green':'gray'}">${loggedIn?'Connected':'Not connected'}</span>
-      </div>
-      <div id="mp-body" style="flex:1;overflow-y:auto;padding:14px;display:flex;flex-direction:column;gap:12px"></div>
-    </div>`);
-  renderMusicPlayer();
-}
-
-async function renderMusicPlayer(){
-  const body=document.getElementById('mp-body');if(!body)return;
-  if(!spotifyClientId){
-    body.innerHTML=`
-      <div style="font-size:12px;color:var(--t2);line-height:1.7">
-        <strong style="color:var(--t1)">One-time setup needed</strong> — this needs a free Spotify Developer Client ID before anyone can log in. This is a one-time step for whoever owns this site (not something each listener needs to do).
-      </div>
-      <div style="font-size:11.5px;color:var(--t3);line-height:1.8;background:rgba(245,200,66,.06);border:1px solid rgba(245,200,66,.15);border-radius:9px;padding:12px">
-        1. Go to <strong style="color:var(--t1)">developer.spotify.com/dashboard</strong> and log in<br>
-        2. Click <strong style="color:var(--t1)">Create app</strong><br>
-        3. App name: anything. Redirect URI: paste this exact address —<br>
-        <code style="background:rgba(0,0,0,.3);padding:2px 6px;border-radius:4px;font-size:10px;word-break:break-all;display:inline-block;margin:4px 0">${esc(location.origin+location.pathname)}</code><br>
-        4. Save, open the app, copy the <strong style="color:var(--t1)">Client ID</strong> shown there<br>
-        5. Paste it below
-      </div>
-      <input class="setinput" id="mp-clientid-input" placeholder="Paste Spotify Client ID here">
-      <button class="setbtn" onclick="saveSpotifyClientId()">Save Client ID</button>
-    `;
-    return;
-  }
-  if(!spotifyAccessToken){
-    body.innerHTML=`
-      <div style="font-size:12px;color:var(--t2);line-height:1.6">Client ID is set. Now log in with your own Spotify account to search and play your music.</div>
-      <button class="setbtn" style="background:#1DB954;color:#fff" onclick="spotifyLogin()">Log in with Spotify</button>
-      <div style="font-size:10.5px;color:var(--t3);line-height:1.6">Playback uses Spotify's official embedded player. Free accounts hear occasional ads, same as on spotify.com; Premium accounts get ad-free playback automatically once logged in.</div>
-    `;
-    return;
-  }
-  if(!spotifyUser){ spotifyUser=await spotifyFetchMe(); }
-  body.innerHTML=`
-    <div style="display:flex;align-items:center;gap:10px">
-      <div style="width:36px;height:36px;border-radius:50%;background:#1DB954;display:flex;align-items:center;justify-content:center;font-weight:700;color:#000;flex-shrink:0">${esc((spotifyUser?.display_name||'S')[0])}</div>
-      <div style="flex:1;overflow:hidden">
-        <div style="font-size:12px;font-weight:600;color:var(--t1);overflow:hidden;text-overflow:ellipsis">${esc(spotifyUser?.display_name||'Spotify User')}</div>
-        <div style="font-size:10px;color:var(--t3)">${esc(spotifyUser?.product==='premium'?'Premium':'Free plan')}</div>
-      </div>
-      <button class="setbtn ghost" style="font-size:10px;padding:5px 10px" onclick="spotifyLogout()">Log out</button>
-    </div>
-    <input class="setinput" id="mp-search-input" placeholder="Search a song, artist, or album…" style="margin-top:0" onkeydown="if(event.key==='Enter')spotifyDoSearch()">
-    <div id="mp-search-results" style="display:flex;flex-direction:column;gap:2px"></div>
-    <div id="mp-player-mount" style="margin-top:auto;flex-shrink:0"></div>
-  `;
-}
-function saveSpotifyClientId(){
-  const inp=document.getElementById('mp-clientid-input');if(!inp)return;
-  const v=inp.value.trim();if(!v)return;
-  spotifyClientId=v;localStorage.setItem('cb_spotify_client_id',v);
-  renderMusicPlayer();
-}
-async function spotifyDoSearch(){
-  const inp=document.getElementById('mp-search-input');if(!inp)return;
-  const q=inp.value.trim();if(!q)return;
-  const results=document.getElementById('mp-search-results');
-  if(results)results.innerHTML='<div style="font-size:11px;color:var(--t3);padding:8px">Searching…</div>';
-  const tracks=await spotifySearch(q);
-  if(!results)return;
-  if(!tracks.length){results.innerHTML='<div style="font-size:11px;color:var(--t3);padding:8px">No results</div>';return;}
-  results.innerHTML=tracks.map(t=>`
-    <div class="mp-track" onclick="spotifyPlay('${t.uri}')" style="padding:8px 6px">
-      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>
-      <div style="overflow:hidden;flex:1">
-        <div style="font-size:12px;color:var(--t1);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(t.name)}</div>
-        <div style="font-size:10px;color:var(--t3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(t.artists?.map(a=>a.name).join(', ')||'')}</div>
-      </div>
-    </div>`).join('');
-}
-async function spotifyPlay(uri){
-  spotifyCurrentUri=uri;
-  const mount=document.getElementById('mp-player-mount');if(!mount)return;
-  mount.innerHTML='<div id="spotify-embed-target" style="border-radius:10px;overflow:hidden"></div>';
-  const api=await ensureSpotifyIframeApi();
-  const el=document.getElementById('spotify-embed-target');
-  api.createController(el,{uri,width:'100%',height:'80'},(controller)=>{
-    spotifyIframeController=controller;
-  });
-}
-
-/* ══════════════════════════════════════════
    🖼️ IMAGE GALLERY (placeholder swatches — no bundled images)
 ══════════════════════════════════════════ */
 const GALLERY_COLORS=['#F5C842,#D4A800','#5AC8FA,#1E7FCC','#34D399,#0D9268','#F472B6,#BE185D','#A78BFA,#6B46C1','#FB923C,#C2410C','#2DD4BF,#0F766E','#FB7185,#BE123C'];
@@ -1500,19 +1337,156 @@ function openImageViewer(){
 }
 
 /* ══════════════════════════════════════════
-   ☁️ WEATHER (placeholder data — wire to a real API if desired)
+   🎵 MUSIC — no login, no account, nothing to set up.
+   Plays curated YouTube playlists right inside the window via the
+   standard YouTube embed (same one used in the YouTube app), so there
+   is no API key, no Spotify dependency, and nothing for you to configure.
 ══════════════════════════════════════════ */
+const MUSIC_STATIONS=[
+  {label:'Lo-Fi Beats',        id:'jfKfPfyJRdk'},
+  {label:'Today\'s Top Hits',  id:'PLrAl6rYAS4MOzCBQyilTQGcQYNVdpRkur'},
+  {label:'Chill Acoustic',     id:'PL5jZJ6gqOQzL5cZuoaLcMc3fnxIqUyJ4t'},
+  {label:'Workout / Hype',     id:'PL3oW2tjiIxvQW6c-4Iry8Bpp3QId40S5S'},
+  {label:'Focus / Study',      id:'PLrAl6rYAS4MOiQhdL2I0AQwn9_pwTtm9D'},
+  {label:'80s/90s Throwback',  id:'PLG46pXQqfb7Y4eo9P0t9-pjjsJFqL_lZ8'},
+];
+function openMusicPlayer(){
+  mkWin('musicplayer','Music','musicplayer',420,560,`
+    <div style="display:flex;flex-direction:column;height:100%;overflow:hidden">
+      <div style="padding:12px 14px;border-bottom:1px solid var(--b1);flex-shrink:0">
+        <div style="font-size:12px;font-weight:600;color:var(--t1)">Pick a station — plays instantly, no account needed</div>
+      </div>
+      <div style="flex:1;overflow-y:auto;padding:10px;display:flex;flex-direction:column;gap:4px" id="music-station-list"></div>
+      <div id="music-player-mount" style="flex-shrink:0;border-top:1px solid var(--b1)"></div>
+    </div>`);
+  renderMusicStations();
+}
+function renderMusicStations(){
+  const el=document.getElementById('music-station-list');if(!el)return;
+  el.innerHTML=MUSIC_STATIONS.map((s,i)=>`
+    <div class="mp-track" onclick="playMusicStation(${i})" style="border-radius:9px">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>
+      <span style="font-size:12px">${esc(s.label)}</span>
+    </div>`).join('');
+}
+function playMusicStation(i){
+  const s=MUSIC_STATIONS[i];if(!s)return;
+  const mount=document.getElementById('music-player-mount');if(!mount)return;
+  const isPlaylist=s.id.length>15; // crude check: playlist IDs are long, video IDs are ~11 chars
+  const src=isPlaylist
+    ? `https://www.youtube.com/embed/videoseries?list=${encodeURIComponent(s.id)}&autoplay=1`
+    : `https://www.youtube.com/embed/${encodeURIComponent(s.id)}?autoplay=1`;
+  mount.innerHTML=`<iframe width="100%" height="220" src="${src}" frameborder="0" allow="autoplay; encrypted-media" allowfullscreen style="border:none;display:block"></iframe>`;
+}
+
+/* ══════════════════════════════════════════
+   ☁️ WEATHER — real, live data via Open-Meteo (free, no key, no account)
+   Same underlying approach as Google's weather card: current conditions
+   from the user's geolocation (with a graceful manual fallback), plus a
+   5-day forecast. WMO weather codes are mapped to icons/descriptions.
+══════════════════════════════════════════ */
+const WMO_CODES={
+  0:['Clear sky','☀️'],1:['Mainly clear','🌤️'],2:['Partly cloudy','⛅'],3:['Overcast','☁️'],
+  45:['Fog','🌫️'],48:['Freezing fog','🌫️'],
+  51:['Light drizzle','🌦️'],53:['Drizzle','🌦️'],55:['Dense drizzle','🌧️'],
+  56:['Freezing drizzle','🌧️'],57:['Freezing drizzle','🌧️'],
+  61:['Light rain','🌧️'],63:['Rain','🌧️'],65:['Heavy rain','🌧️'],
+  66:['Freezing rain','🌧️'],67:['Freezing rain','🌧️'],
+  71:['Light snow','🌨️'],73:['Snow','🌨️'],75:['Heavy snow','❄️'],77:['Snow grains','🌨️'],
+  80:['Light showers','🌦️'],81:['Showers','🌧️'],82:['Violent showers','⛈️'],
+  85:['Snow showers','🌨️'],86:['Heavy snow showers','❄️'],
+  95:['Thunderstorm','⛈️'],96:['Thunderstorm w/ hail','⛈️'],99:['Severe thunderstorm','⛈️'],
+};
+function wmoInfo(code){return WMO_CODES[code]||['Unknown','🌡️'];}
+let weatherUnitC=true;
+function c2f(c){return Math.round(c*9/5+32);}
 function openWeather(){
-  const days=['Mon','Tue','Wed','Thu','Fri'];
-  const temps=[68,72,65,70,74];
-  mkWin('weather','Weather','weather',340,420,`
+  mkWin('weather','Weather','weather',360,460,`
+    <div style="display:flex;flex-direction:column;height:100%;overflow:hidden">
+      <div style="padding:10px 14px;border-bottom:1px solid var(--b1);display:flex;gap:6px;align-items:center;flex-shrink:0">
+        <input class="setinput" id="wx-city-input" placeholder="Search a city… (or allow location)" style="margin-top:0;flex:1" onkeydown="if(event.key==='Enter')weatherSearchCity()">
+        <button class="brbtn" onclick="weatherSearchCity()" title="Search"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg></button>
+        <button class="brbtn" onclick="weatherUnitC=!weatherUnitC;weatherRerender()" title="Toggle °C/°F" id="wx-unit-btn" style="font-size:10px;font-weight:700;width:auto;padding:0 8px">°C</button>
+      </div>
+      <div id="wx-content" style="flex:1;overflow-y:auto">
+        <div class="wx-main"><div style="font-size:12px;color:var(--t3)">Getting your location…</div></div>
+      </div>
+    </div>`);
+  weatherInitLocation();
+}
+let weatherLastData=null;
+function weatherInitLocation(){
+  if(window.__isFileProtocol){weatherShowError("Live weather needs a real website address (geolocation and the weather API are both blocked on a downloaded file). See Settings → Network.");return;}
+  if(!navigator.geolocation){weatherShowError('Your browser does not support geolocation. Try searching for a city by name instead.');return;}
+  navigator.geolocation.getCurrentPosition(
+    pos=>weatherLoad(pos.coords.latitude,pos.coords.longitude,null),
+    err=>weatherShowError('Location access was denied or unavailable. Search for a city by name above instead.'),
+    {timeout:8000}
+  );
+}
+async function weatherSearchCity(){
+  const inp=document.getElementById('wx-city-input');if(!inp)return;
+  const q=inp.value.trim();if(!q)return;
+  const content=document.getElementById('wx-content');
+  if(content)content.innerHTML='<div class="wx-main"><div style="font-size:12px;color:var(--t3)">Searching…</div></div>';
+  try{
+    const geoResp=await fetch(`https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(q)}&count=1`);
+    const geoData=await geoResp.json();
+    const place=geoData.results?.[0];
+    if(!place){weatherShowError(`No location found for "${q}". Try a different spelling.`);return;}
+    weatherLoad(place.latitude,place.longitude,`${place.name}${place.admin1?', '+place.admin1:''}${place.country?', '+place.country:''}`);
+  }catch(e){weatherShowError('Could not search for that city — check your internet connection.');}
+}
+async function weatherLoad(lat,lon,knownLabel){
+  const content=document.getElementById('wx-content');
+  try{
+    const url=`https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,weather_code&daily=temperature_2m_max,temperature_2m_min,weather_code&timezone=auto&forecast_days=6`;
+    const resp=await fetch(url);
+    if(!resp.ok)throw new Error('Weather service returned '+resp.status);
+    const data=await resp.json();
+    let label=knownLabel;
+    if(!label){
+      try{
+        const revResp=await fetch(`https://geocoding-api.open-meteo.com/v1/search?latitude=${lat}&longitude=${lon}&count=1`);
+        // Open-Meteo geocoding doesn't support reverse lookup directly; fall back to coordinates label.
+      }catch(e){}
+      label=`Your location (${lat.toFixed(2)}, ${lon.toFixed(2)})`;
+    }
+    weatherLastData={data,label,lat,lon};
+    weatherRerender();
+  }catch(e){
+    weatherShowError('Could not load live weather data — check your internet connection and try again.');
+  }
+}
+function weatherRerender(){
+  if(!weatherLastData)return;
+  const {data,label}=weatherLastData;
+  const unitBtn=document.getElementById('wx-unit-btn');if(unitBtn)unitBtn.textContent=weatherUnitC?'°C':'°F';
+  const cur=data.current;
+  const [curDesc,curIcon]=wmoInfo(cur.weather_code);
+  const curTemp=weatherUnitC?Math.round(cur.temperature_2m):c2f(cur.temperature_2m);
+  const days=data.daily.time.map((t,i)=>{
+    const d=new Date(t+'T00:00:00');
+    const dayName=i===0?'Today':d.toLocaleDateString([],{weekday:'short'});
+    const hi=weatherUnitC?Math.round(data.daily.temperature_2m_max[i]):c2f(data.daily.temperature_2m_max[i]);
+    const lo=weatherUnitC?Math.round(data.daily.temperature_2m_min[i]):c2f(data.daily.temperature_2m_min[i]);
+    const [,icon]=wmoInfo(data.daily.weather_code[i]);
+    return {dayName,hi,lo,icon};
+  }).slice(0,6);
+  const content=document.getElementById('wx-content');if(!content)return;
+  content.innerHTML=`
     <div class="wx-main">
-      <svg width="56" height="56" viewBox="0 0 24 24" fill="none"><circle cx="10" cy="9" r="5" fill="#FCD34D"/><path d="M3,16 a4,4 0 0 1 0,-8 q1,-3 5,-3 q5,0 5,5 a4,4 0 0 1 4,6 a4,4 0 0 1 -4,4 h-10 a4,4 0 0 1 -4,-4z" fill="#E2E8F0"/></svg>
-      <div class="wx-temp">71°</div>
-      <div class="wx-desc">Partly Cloudy</div>
-      <div class="wx-loc">Sample data — connect a weather API for live data</div>
+      <div style="font-size:48px;line-height:1">${curIcon}</div>
+      <div class="wx-temp">${curTemp}°</div>
+      <div class="wx-desc">${esc(curDesc)}</div>
+      <div class="wx-loc">${esc(label)}</div>
     </div>
-    <div class="wx-grid">${days.map((d,i)=>`<div class="wx-day"><div class="wx-day-name">${d}</div><div class="wx-day-temp">${temps[i]}°</div></div>`).join('')}</div>`);
+    <div class="wx-grid">${days.map(d=>`<div class="wx-day"><div class="wx-day-name">${esc(d.dayName)}</div><div style="font-size:18px;margin:4px 0">${d.icon}</div><div class="wx-day-temp">${d.hi}°</div><div style="font-size:10px;color:var(--t3)">${d.lo}°</div></div>`).join('')}</div>
+    <div style="text-align:center;padding:8px;font-size:9px;color:var(--t3)">Live data via Open-Meteo</div>`;
+}
+function weatherShowError(msg){
+  const content=document.getElementById('wx-content');if(!content)return;
+  content.innerHTML=`<div class="wx-main"><svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="color:var(--t3)"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg><div style="font-size:12px;color:var(--t2);max-width:240px;text-align:center;margin-top:8px">${esc(msg)}</div></div>`;
 }
 
 /* ══════════════════════════════════════════
@@ -1568,15 +1542,14 @@ const SETT={
     <div class="setr"><div><div class="setrt">Volume</div><div class="setrs">Master volume level</div></div><input class="setsl" type="range" min="0" max="100" value="${volLvl}" oninput="setVol(this.value)"></div>
     <div class="setr"><div><div class="setrt">System Sounds</div><div class="setrs">UI notification sounds</div></div><div class="tog" onclick="this.classList.toggle('on')"></div></div>`,
   ai:()=>`<div class="setlbl">AI Assistants</div>
-    <div class="setr"><div><div class="setrt">Local AI (General)</div><div class="setrs">SmolLM2-360M via Transformers.js — offline, free, no key</div></div><span class="badge green">Always free</span></div>
-    <div class="setr"><div><div class="setrt">Code AI</div><div class="setrs">Qwen2.5-Coder-0.5B via Transformers.js — offline, free, no key</div></div><span class="badge green">Always free</span></div>
+    <div class="setr"><div><div class="setrt">Local AI (General)</div><div class="setrs">SmolLM2-360M — loads into browser cache only, nothing saved to your PC</div></div><span class="badge green">Always free</span></div>
+    <div class="setr"><div><div class="setrt">Code AI</div><div class="setrs">Qwen2.5-Coder-0.5B — loads into browser cache only, nothing saved to your PC</div></div><span class="badge green">Always free</span></div>
     <div class="setr"><div><div class="setrt">Runtime requirement</div><div class="setrs">Needs a real website address — won't load from a downloaded file</div></div><span class="badge ${window.__isFileProtocol?'red':'green'}">${window.__isFileProtocol?'Blocked now':'OK'}</span></div>
     <div class="setr"><div><div class="setrt">Background thread</div><div class="setrs">Both models run in a Web Worker so the page never freezes</div></div><span class="badge green">Active</span></div>`,
-  music:()=>`<div class="setlbl">Music — Spotify</div>
-    <div class="setr"><div><div class="setrt">Client ID</div><div class="setrs">${spotifyClientId?'Configured':'Not set — open the Music app to set it up'}</div></div><span class="badge ${spotifyClientId?'green':'gray'}">${spotifyClientId?'Set':'Missing'}</span></div>
-    <div class="setr"><div><div class="setrt">Account</div><div class="setrs">${spotifyAccessToken?'Logged in':'Each listener logs in with their own Spotify account from the Music app'}</div></div><span class="badge ${spotifyAccessToken?'green':'gray'}">${spotifyAccessToken?'Connected':'Not connected'}</span></div>
-    ${spotifyClientId?`<div class="setr"><div><div class="setrt">Reset Client ID</div><div class="setrs">Remove the saved Spotify app credentials</div></div><button class="setbtn danger" onclick="if(confirm('Remove saved Spotify Client ID?')){spotifyClientId='';localStorage.removeItem('cb_spotify_client_id');spotifyLogout();}">Remove</button></div>`:''}
-    <div style="margin-top:10px;font-size:11px;color:var(--t3);line-height:1.7">Playback uses Spotify's official embedded player. Free Spotify accounts hear occasional ads (same as spotify.com); Premium accounts get ad-free playback automatically. This never stores passwords — login happens directly on Spotify's own site.</div>`,
+  music:()=>`<div class="setlbl">Music</div>
+    <div class="setr"><div><div class="setrt">Account required</div><div class="setrs">None — no login, no Client ID, nothing to configure</div></div><span class="badge green">Open</span></div>
+    <div class="setr"><div><div class="setrt">Source</div><div class="setrs">Curated YouTube stations, played via standard embed</div></div><span class="badge green">Always free</span></div>
+    <div style="margin-top:10px;font-size:11px;color:var(--t3);line-height:1.7">Spotify integration was removed — it required each site visitor to have their own paid/free Spotify account and a developer Client ID just to set up, which added friction for no real benefit. The Music app now just works the instant you open it.</div>`,
   privacy:()=>`<div class="setlbl">Privacy & Security</div>
     <div class="setr"><div><div class="setrt">Ad Blocker</div><div class="setrs">Block ads in the browser</div></div><div class="tog on" onclick="this.classList.toggle('on')"></div></div>
     <div class="setr"><div><div class="setrt">Do Not Track</div><div class="setrs">Send DNT header</div></div><div class="tog on" onclick="this.classList.toggle('on')"></div></div>
@@ -1598,14 +1571,14 @@ const SETT={
         Once it's set up, anyone — including someone with no technical experience — just opens that link like any normal website. No downloads, no terminal, no installs, ever again.
       </div>
     </div>`:`
-    <div class="setr"><div><div class="setrt">Browser Proxy</div><div class="setrs">corsproxy.io with allorigins.win fallback</div></div><span class="badge green">Active</span></div>
+    <div class="setr"><div><div class="setrt">Browser Proxy</div><div class="setrs">codetabs.com with allorigins.win fallback</div></div><span class="badge green">Active</span></div>
     <div class="setr"><div><div class="setrt">Local AI Runtime</div><div class="setrs">WebGPU (fast) or WASM (fallback)</div></div><span class="badge gold">${('gpu' in navigator)?'WebGPU available':'WASM only'}</span></div>`}`,
   about:()=>`<div class="setlbl">About</div>
     <div style="padding:6px 0;font-size:13px;line-height:2.4;">
       <div style="display:flex;justify-content:space-between;border-bottom:1px solid var(--b1);padding:7px 0"><span style="color:var(--t3)">OS Version</span><span style="color:var(--t1);font-weight:500">CheeseBlock OS v6.0</span></div>
       <div style="display:flex;justify-content:space-between;border-bottom:1px solid var(--b1);padding:7px 0"><span style="color:var(--t3)">Local AI</span><span style="color:var(--gold);font-family:'JetBrains Mono',monospace;font-size:11px">SmolLM2-360M-Instruct</span></div>
       <div style="display:flex;justify-content:space-between;border-bottom:1px solid var(--b1);padding:7px 0"><span style="color:var(--t3)">Code AI</span><span style="color:var(--gold);font-family:'JetBrains Mono',monospace;font-size:11px">Qwen2.5-Coder-0.5B-Instruct</span></div>
-      <div style="display:flex;justify-content:space-between;border-bottom:1px solid var(--b1);padding:7px 0"><span style="color:var(--t3)">Web Proxy</span><span style="color:var(--t1)">corsproxy.io + allorigins.win</span></div>
+      <div style="display:flex;justify-content:space-between;border-bottom:1px solid var(--b1);padding:7px 0"><span style="color:var(--t3)">Web Proxy</span><span style="color:var(--t1)">codetabs.com + allorigins.win</span></div>
       <div style="display:flex;justify-content:space-between;border-bottom:1px solid var(--b1);padding:7px 0"><span style="color:var(--t3)">Screen</span><span style="color:var(--t1)">${screen.width}×${screen.height}</span></div>
       <div style="display:flex;justify-content:space-between;padding:7px 0"><span style="color:var(--t3)">Shortcuts</span><span style="color:var(--t2);font-size:11px">Ctrl+1 through Ctrl+9</span></div>
     </div>`,
@@ -1791,10 +1764,43 @@ function openGameSiteEmbed(id,title,iconKey,url){
     </div>`);
     return;
   }
-  mkWin(id,title,iconKey,920,640,`<iframe src="${url}" style="width:100%;height:100%;border:none;flex:1;background:#0a0a0a" allow="fullscreen; autoplay; gamepad; cross-origin-isolated" sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-pointer-lock"></iframe>`);
+  mkWin(id,title,iconKey,920,640,`
+    <div class="brarea">
+      <div id="${id}-loading" class="br-loading"><div class="br-spinner"></div><div style="font-size:12px;color:var(--t2)">Trying to load ${title}…</div></div>
+      <div id="${id}-block" class="brblock hide">
+        <div class="brblock-icon">${ICONS[iconKey]}</div>
+        <div style="font-size:14px;font-weight:600;color:var(--t1)">${title} can't be embedded</div>
+        <div style="font-size:12px;color:var(--t2);max-width:300px">${title} blocks being loaded inside other sites' windows (this protects their own ad revenue and is true for almost every major game portal, not specific to CheeseBlock). Open it directly instead — it works exactly the same, just in its own tab.</div>
+        <button onclick="window.open('${url}','_blank')" style="padding:9px 22px;border-radius:9px;background:var(--gold);border:none;cursor:pointer;font-size:13px;font-weight:600;color:#000;margin-top:4px">Open ${title} in New Tab ↗</button>
+      </div>
+      <iframe id="${id}-frame" src="${url}" style="width:100%;height:100%;border:none;flex:1;background:#0a0a0a;display:none" allow="fullscreen; autoplay; gamepad; cross-origin-isolated" sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-pointer-lock"
+        onload="gameSiteOnLoad('${id}')" onerror="gameSiteOnBlocked('${id}')"></iframe>
+    </div>`);
+  // X-Frame-Options/CSP blocks don't always fire onerror — give it a moment, then check if it actually rendered.
+  setTimeout(()=>gameSiteCheckBlocked(id),2500);
+}
+function gameSiteOnLoad(id){
+  const loading=document.getElementById(id+'-loading');
+  const frame=document.getElementById(id+'-frame');
+  if(loading)loading.classList.add('hide');
+  if(frame)frame.style.display='block';
+}
+function gameSiteOnBlocked(id){
+  const loading=document.getElementById(id+'-loading'),block=document.getElementById(id+'-block'),frame=document.getElementById(id+'-frame');
+  if(loading)loading.classList.add('hide');
+  if(block)block.classList.remove('hide');
+  if(frame)frame.style.display='none';
+}
+function gameSiteCheckBlocked(id){
+  const frame=document.getElementById(id+'-frame');if(!frame)return;
+  try{
+    // If the frame loaded same-origin-blocked content, contentWindow access throws or stays blank — treat as blocked.
+    if(!frame.contentWindow || frame.style.display==='none'){return;}
+  }catch(e){ gameSiteOnBlocked(id); }
 }
 function openCrazyGames(){ openGameSiteEmbed('crazygames','CrazyGames','crazygames','https://www.crazygames.com/'); }
 function openPoki(){ openGameSiteEmbed('poki','Poki','poki','https://poki.com/'); }
+
 
 /* ══════════════════════════════════════════
    🕹️ 5 CUSTOM MINI-GAMES (lightweight, fully self-contained)
